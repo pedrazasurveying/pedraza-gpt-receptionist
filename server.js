@@ -4,6 +4,7 @@ import websocket from "@fastify/websocket";
 import dotenv from "dotenv";
 import { WebSocket as WS } from "ws";
 import fs from "fs";
+import formbody from "@fastify/formbody";
 
 dotenv.config();
 
@@ -37,23 +38,24 @@ if (!OPENAI_API_KEY) {
 
 const app = Fastify({ logger: true });
 
-// 👇 Accept Twilio's subprotocol "audio" during WS handshake
+// WebSocket plugin (echo Twilio's "audio" subprotocol)
 await app.register(websocket, {
   options: {
     handleProtocols: (protocols /*, request*/) => {
-      // Twilio typically offers ["audio"]; echo it back or refuse
       if (Array.isArray(protocols) && protocols.includes("audio")) return "audio";
-      // If Twilio doesn't send any protocols, allow the connection anyway:
       return protocols && protocols.length ? false : undefined;
     },
   },
 });
 
+// Parse Twilio POST bodies (x-www-form-urlencoded) so we don’t 415
+await app.register(formbody);
+
 // Health
 app.get("/", async (_req, reply) => reply.send("ok"));
 app.get("/healthz", async (_req, reply) => reply.send("ok"));
 
-/** TwiML builder — IMPORTANT: bidirectional audio */
+/** TwiML builder — bidirectional audio */
 function twiml(host) {
   const wsUrl = `wss://${host}/media-stream`;
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -96,8 +98,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
 
   const sendAI = (obj) => {
     const data = JSON.stringify(obj);
-    if (aiReady) ai.send(data);
-    else queue.push(data);
+    if (aiReady) ai.send(data); else queue.push(data);
   };
 
   ai.on("open", () => {
@@ -154,8 +155,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
 
     if (msg.event === "media" && msg.media?.payload) {
       const frame = { type: "input_audio_buffer.append", audio: msg.media.payload, format: "pcmu" };
-      if (aiReady) ai.send(JSON.stringify(frame));
-      else prebuffer.push(frame);
+      if (aiReady) ai.send(JSON.stringify(frame)); else prebuffer.push(frame);
       return;
     }
 
@@ -182,7 +182,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
       connection.send(JSON.stringify({
         event: "media",
         streamSid,
-        track: "outbound",   // <- REQUIRED for bidirectional
+        track: "outbound",   // REQUIRED for bidirectional
         media: { payload: b64 }
       }));
       return;
