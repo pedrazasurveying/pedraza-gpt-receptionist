@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 7860;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini-realtime";
 const VOICE = process.env.VOICE || "alloy";
-const STREAM_SECRET = process.env.STREAM_SECRET; // optional shared-secret header
+const STREAM_SECRET = process.env.STREAM_SECRET; // optional shared-secret
 
 // Prompts/KB
 const RECEPTIONIST_PROMPT = (process.env.RECEPTIONIST_PROMPT || "").trim();
@@ -42,7 +42,7 @@ await app.register(websocket);
 app.get("/", async (_req, reply) => reply.send("ok"));
 app.get("/healthz", async (_req, reply) => reply.send("ok"));
 
-/** TwiML builder: IMPORTANT -> track="both_tracks" for bidirectional audio */
+/** TwiML builder — IMPORTANT: bidirectional audio */
 function twiml(host) {
   const wsUrl = `wss://${host}/media-stream`;
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -64,7 +64,7 @@ async function incomingCall(req, reply) {
 app.get("/incoming-call", incomingCall);
 app.post("/incoming-call", incomingCall);
 
-/** Twilio opens this WebSocket to stream the call audio */
+/** Media stream: Twilio opens WS here */
 app.get("/media-stream", { websocket: true }, (connection, req) => {
   if (STREAM_SECRET && req.headers["x-pedraza-secret"] !== STREAM_SECRET) {
     connection.close();
@@ -80,7 +80,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
   const queue = [];
   const prebuffer = [];
   let textBuf = "";
-  let streamSid = null;        // <-- capture Twilio stream ID
+  let streamSid = null;            // <- Twilio stream ID is REQUIRED for outbound audio
   let outCount = 0;
 
   const sendAI = (obj) => {
@@ -102,7 +102,6 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
-      // streamSid is REQUIRED for sending audio back to Twilio
       streamSid = msg.start?.streamSid || msg.streamSid || null;
       app.log.info({ streamSid }, "Twilio stream started");
 
@@ -116,7 +115,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
         type: "session.update",
         session: {
           instructions,
-          modalities: ["audio", "text"],       // audio for caller, text for tag logging
+          modalities: ["audio", "text"],      // audio for caller, text for tag logging
           voice: VOICE,
           input_audio_format:  { type: "pcmu", sample_rate_hz: 8000 },
           output_audio_format: { type: "pcmu", sample_rate_hz: 8000 },
@@ -136,10 +135,14 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
       return;
     }
 
+    if (msg.event === "connected") {
+      // optional: Twilio sends this early; nothing required here
+      return;
+    }
+
     if (msg.event === "media" && msg.media?.payload) {
       const frame = { type: "input_audio_buffer.append", audio: msg.media.payload, format: "pcmu" };
-      if (aiReady) ai.send(JSON.stringify(frame));
-      else prebuffer.push(frame);
+      if (aiReady) ai.send(JSON.stringify(frame)); else prebuffer.push(frame);
       return;
     }
 
@@ -154,7 +157,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
   ai.on("message", (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    // AUDIO chunks (handle multiple schema variants)
+    // AUDIO chunks (tolerate schema variants)
     const b64 =
       (msg.type === "response.output_audio.delta" && msg.delta) ||
       (msg.type === "response.audio.delta" && msg.delta) ||
@@ -162,8 +165,13 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
 
     if (b64 && streamSid) {
       outCount++;
-      if (outCount % 25 === 0) app.log.info({ outCount }, "Sending audio frames to Twilio");
-      connection.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+      if (outCount % 10 === 0) app.log.info({ outCount }, "sent outbound audio");
+      connection.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        track: "outbound",            // <-- REQUIRED for bidirectional
+        media: { payload: b64 }
+      }));
       return;
     }
 
@@ -177,7 +185,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
       return;
     }
 
-    // End-of-utterance markers
+    // Utterance end
     if (
       msg.type === "response.output_audio.done" ||
       msg.type === "output_audio.done" ||
@@ -186,11 +194,16 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
       if (streamSid) {
         connection.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "done" } }));
       }
-      // Detect and log routing tag if Elena appended one
+      // Detect and log routing tag (not spoken)
       const m = textBuf.match(/\[\[ROUTE:(CINDY|BRENDA|JAY|JOSE|TAKE_MESSAGE|END)\]\]/i);
       if (m) app.log.info({ route_tag: m[0] }, "Elena route tag");
       textBuf = "";
       return;
+    }
+
+    // Pass-through commits if model requests
+    if (msg.type === "input_audio_buffer.commit") {
+      sendAI({ type: "input_audio_buffer.commit" });
     }
   });
 
