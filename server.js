@@ -13,14 +13,13 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini-realtime";
 const VOICE = process.env.VOICE || "alloy";
 const STREAM_SECRET = process.env.STREAM_SECRET; // optional shared-secret header
 
-// Prompts/KB sources
+// Prompts/KB
 const RECEPTIONIST_PROMPT = (process.env.RECEPTIONIST_PROMPT || "").trim();
 const KB_TEXT = (process.env.KB_TEXT || "").trim();
 const KB_FILE = fs.existsSync("./kb.md")  ? fs.readFileSync("./kb.md",  "utf8") : "";
 const FAQ_FILE = fs.existsSync("./faq.md") ? fs.readFileSync("./faq.md", "utf8") : "";
 const SOP_FILE = fs.existsSync("./sop.md") ? fs.readFileSync("./sop.md", "utf8") : "";
 
-// Assemble a single KB blob (trim to avoid huge payloads)
 function buildKB() {
   let parts = [];
   if (KB_TEXT) parts.push(KB_TEXT);
@@ -28,8 +27,7 @@ function buildKB() {
   if (FAQ_FILE) parts.push(`\n# FAQ\n${FAQ_FILE}`);
   if (SOP_FILE) parts.push(`\n# SOP\n${SOP_FILE}`);
   const joined = parts.join("\n\n").trim();
-  // hard cap ~60k chars to keep the first turn fast (tune as needed)
-  return joined.slice(0, 60000);
+  return joined.slice(0, 60000); // cap for snappy first turn
 }
 
 if (!OPENAI_API_KEY) {
@@ -44,12 +42,18 @@ await app.register(websocket);
 app.get("/", async (_req, reply) => reply.send("ok"));
 app.get("/healthz", async (_req, reply) => reply.send("ok"));
 
+/** TwiML builder: IMPORTANT -> track="both_tracks" for bidirectional audio */
 function twiml(host) {
   const wsUrl = `wss://${host}/media-stream`;
   return `<?xml version="1.0" encoding="UTF-8"?>
-<Response><Connect><Stream url="${wsUrl}"/></Connect></Response>`;
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}" track="both_tracks" />
+  </Connect>
+</Response>`;
 }
 
+/** Twilio fetches TwiML here (GET or POST). */
 async function incomingCall(req, reply) {
   if (STREAM_SECRET && req.headers["x-pedraza-secret"] !== STREAM_SECRET) {
     reply.code(403).send("Forbidden");
@@ -60,6 +64,7 @@ async function incomingCall(req, reply) {
 app.get("/incoming-call", incomingCall);
 app.post("/incoming-call", incomingCall);
 
+/** Twilio opens this WebSocket to stream the call audio */
 app.get("/media-stream", { websocket: true }, (connection, req) => {
   if (STREAM_SECRET && req.headers["x-pedraza-secret"] !== STREAM_SECRET) {
     connection.close();
@@ -74,7 +79,9 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
   let aiReady = false;
   const queue = [];
   const prebuffer = [];
-  let textBuf = ""; // capture text output for tags/logging
+  let textBuf = "";
+  let streamSid = null;        // <-- capture Twilio stream ID
+  let outCount = 0;
 
   const sendAI = (obj) => {
     const data = JSON.stringify(obj);
@@ -90,10 +97,15 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
     }
   });
 
+  // ---- Twilio -> OpenAI ----
   connection.on("message", (raw) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
+      // streamSid is REQUIRED for sending audio back to Twilio
+      streamSid = msg.start?.streamSid || msg.streamSid || null;
+      app.log.info({ streamSid }, "Twilio stream started");
+
       const base = RECEPTIONIST_PROMPT || "You are Pedraza Surveying's receptionist. Be brief, friendly, efficient.";
       const kb = buildKB();
       const instructions = kb
@@ -104,7 +116,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
         type: "session.update",
         session: {
           instructions,
-          modalities: ["audio", "text"], // get text too for logging/tags
+          modalities: ["audio", "text"],       // audio for caller, text for tag logging
           voice: VOICE,
           input_audio_format:  { type: "pcmu", sample_rate_hz: 8000 },
           output_audio_format: { type: "pcmu", sample_rate_hz: 8000 },
@@ -112,10 +124,11 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
         },
       });
 
-      // Greet immediately (even if caller is silent)
+      // Greet immediately even if caller is silent
       sendAI({
         type: "response.create",
         response: {
+          modalities: ["audio"],
           instructions:
             "Hi. Thank you for calling Pedraza Surveying, also known as Tejas Surveying. This is Elena, how can I help you today?",
         },
@@ -125,7 +138,8 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
 
     if (msg.event === "media" && msg.media?.payload) {
       const frame = { type: "input_audio_buffer.append", audio: msg.media.payload, format: "pcmu" };
-      if (aiReady) ai.send(JSON.stringify(frame)); else prebuffer.push(frame);
+      if (aiReady) ai.send(JSON.stringify(frame));
+      else prebuffer.push(frame);
       return;
     }
 
@@ -136,20 +150,24 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
     }
   });
 
+  // ---- OpenAI -> Twilio ----
   ai.on("message", (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    // AUDIO back to Twilio (tolerate schema variants)
+    // AUDIO chunks (handle multiple schema variants)
     const b64 =
       (msg.type === "response.output_audio.delta" && msg.delta) ||
       (msg.type === "response.audio.delta" && msg.delta) ||
       (msg.type === "output_audio.delta" && msg.audio) || null;
-    if (b64) {
-      connection.send(JSON.stringify({ event: "media", media: { payload: b64 } }));
+
+    if (b64 && streamSid) {
+      outCount++;
+      if (outCount % 25 === 0) app.log.info({ outCount }, "Sending audio frames to Twilio");
+      connection.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
       return;
     }
 
-    // TEXT accumulation (for tags/transcripts)
+    // TEXT deltas (for route tag logging)
     const textDelta =
       (msg.type === "response.output_text.delta" && msg.delta) ||
       (msg.type === "response.text.delta" && msg.delta) ||
@@ -159,18 +177,25 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
       return;
     }
 
-    // Utterance end
-    if (msg.type === "response.output_audio.done" || msg.type === "output_audio.done" || msg.type === "response.completed") {
-      connection.send(JSON.stringify({ event: "mark", mark: { name: "done" } }));
-      // Basic tag detection (logs only for now)
+    // End-of-utterance markers
+    if (
+      msg.type === "response.output_audio.done" ||
+      msg.type === "output_audio.done" ||
+      msg.type === "response.completed"
+    ) {
+      if (streamSid) {
+        connection.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "done" } }));
+      }
+      // Detect and log routing tag if Elena appended one
       const m = textBuf.match(/\[\[ROUTE:(CINDY|BRENDA|JAY|JOSE|TAKE_MESSAGE|END)\]\]/i);
       if (m) app.log.info({ route_tag: m[0] }, "Elena route tag");
+      textBuf = "";
       return;
     }
   });
 
   ai.on("close",  () => { try { connection.close(); } catch {} });
-  ai.on("error",  () => { try { connection.close(); } catch {} });
+  ai.on("error",  (err) => { app.log.error(err, "AI socket error"); try { connection.close(); } catch {} });
   connection.on("close", () => { try { ai.close(); } catch {} });
 });
 
