@@ -1,0 +1,13 @@
+{
+  "name": "pedraza-gpt-receptionist",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "fastify": "^4.27.2",
+    "@fastify/websocket": "^10.0.1",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}
