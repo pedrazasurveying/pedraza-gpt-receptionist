@@ -36,7 +36,18 @@ if (!OPENAI_API_KEY) {
 }
 
 const app = Fastify({ logger: true });
-await app.register(websocket);
+
+// 👇 Accept Twilio's subprotocol "audio" during WS handshake
+await app.register(websocket, {
+  options: {
+    handleProtocols: (protocols /*, request*/) => {
+      // Twilio typically offers ["audio"]; echo it back or refuse
+      if (Array.isArray(protocols) && protocols.includes("audio")) return "audio";
+      // If Twilio doesn't send any protocols, allow the connection anyway:
+      return protocols && protocols.length ? false : undefined;
+    },
+  },
+});
 
 // Health
 app.get("/", async (_req, reply) => reply.send("ok"));
@@ -80,12 +91,13 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
   const queue = [];
   const prebuffer = [];
   let textBuf = "";
-  let streamSid = null;            // <- Twilio stream ID is REQUIRED for outbound audio
+  let streamSid = null; // Twilio stream ID (required for outbound)
   let outCount = 0;
 
   const sendAI = (obj) => {
     const data = JSON.stringify(obj);
-    if (aiReady) ai.send(data); else queue.push(data);
+    if (aiReady) ai.send(data);
+    else queue.push(data);
   };
 
   ai.on("open", () => {
@@ -136,13 +148,14 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
     }
 
     if (msg.event === "connected") {
-      // optional: Twilio sends this early; nothing required here
+      app.log.info("Twilio WS connected");
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
       const frame = { type: "input_audio_buffer.append", audio: msg.media.payload, format: "pcmu" };
-      if (aiReady) ai.send(JSON.stringify(frame)); else prebuffer.push(frame);
+      if (aiReady) ai.send(JSON.stringify(frame));
+      else prebuffer.push(frame);
       return;
     }
 
@@ -169,7 +182,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
       connection.send(JSON.stringify({
         event: "media",
         streamSid,
-        track: "outbound",            // <-- REQUIRED for bidirectional
+        track: "outbound",   // <- REQUIRED for bidirectional
         media: { payload: b64 }
       }));
       return;
@@ -209,6 +222,7 @@ app.get("/media-stream", { websocket: true }, (connection, req) => {
 
   ai.on("close",  () => { try { connection.close(); } catch {} });
   ai.on("error",  (err) => { app.log.error(err, "AI socket error"); try { connection.close(); } catch {} });
+  connection.on("error", (err) => { app.log.error(err, "Twilio WS error"); });
   connection.on("close", () => { try { ai.close(); } catch {} });
 });
 
